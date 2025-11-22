@@ -1,0 +1,13 @@
+[package]
+name = "rbar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+rbar-render = { path = "../rbar-render" }
+smithay-client-toolkit = "0.20.0"
+tokio = { version = "1.48.0", features = ["full"] }
+wayland-backend = { version = "0.3.11", features = ["client_system"] }
+wayland-client = "0.31.11"
+wayland-protocols = "0.32.9"
