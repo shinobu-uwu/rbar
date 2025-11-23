@@ -4,13 +4,15 @@ mod structures;
 use std::ptr::NonNull;
 
 use anyhow::Result;
-use bytemuck::cast_slice;
+use bytemuck::{bytes_of, cast_slice};
 use wayland_client::backend::ObjectId;
 use wgpu::{
-    Backends, BufferUsages, ColorTargetState, DeviceDescriptor, FragmentState, IndexFormat,
-    Instance, InstanceDescriptor, LoadOp, Operations, PipelineCompilationOptions,
-    PipelineLayoutDescriptor, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
-    RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, StoreOp, Surface,
+    Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
+    BindGroupLayoutDescriptor, BindGroupLayoutEntry, Buffer, BufferDescriptor, BufferUsages,
+    ColorTargetState, CompositeAlphaMode, DeviceDescriptor, FragmentState, IndexFormat, Instance,
+    InstanceDescriptor, LoadOp, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor,
+    PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, RequestAdapterOptions, ShaderStages, StoreOp, Surface,
     SurfaceConfiguration,
     SurfaceTargetUnsafe::RawHandle,
     TextureFormat, TextureUsages, VertexState, include_wgsl,
@@ -18,16 +20,19 @@ use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
 };
 
-use crate::{context::WgpuContext, structures::Position};
+use crate::{
+    context::WgpuContext,
+    structures::{Color, Globals, Position, Size, WidgetInstance},
+};
 
-const RECT_VERTICES: &[Position] = &[
+const QUAD_VERTICES: &[Position] = &[
     Position(-0.5, -0.5), // bottom-left
     Position(0.5, -0.5),  // bottom-right
     Position(-0.5, 0.5),  // top-left
     Position(0.5, 0.5),   // top-right
 ];
 
-const RECT_INDICES: &[u16] = &[0, 1, 2, 2, 1, 3];
+const QUAD_INDICES: &[u16] = &[0, 1, 2, 2, 1, 3];
 
 pub struct Renderer {
     instance: Instance,
@@ -41,6 +46,10 @@ pub struct SurfaceRenderer {
     pipeline: RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    global_buffer: wgpu::Buffer,
+    widget_buffer: wgpu::Buffer,
+    widget_count: u32,
+    bind_group: BindGroup,
     num_indices: u32,
 }
 
@@ -60,18 +69,22 @@ impl Renderer {
         Ok(Self { instance, context })
     }
 
-    fn create_pipeline(&self, format: TextureFormat) -> RenderPipeline {
+    fn create_pipeline(
+        &self,
+        format: TextureFormat,
+        bind_group_layout: &BindGroupLayout,
+    ) -> RenderPipeline {
         let shader = self
             .context
             .device
-            .create_shader_module(include_wgsl!("../shaders/rectangle.wgsl"));
+            .create_shader_module(include_wgsl!("../shaders/quad.wgsl"));
 
         let layout = self
             .context
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("pipeline layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -83,7 +96,7 @@ impl Renderer {
                 vertex: VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[Position::descriptor()],
+                    buffers: &[Position::descriptor(), WidgetInstance::descriptor()],
                     compilation_options: PipelineCompilationOptions::default(),
                 },
                 fragment: Some(FragmentState {
@@ -136,9 +149,9 @@ impl Renderer {
         let alpha_mode = surface_caps
             .alpha_modes
             .iter()
-            .find(|&m| *m == wgpu::CompositeAlphaMode::PreMultiplied)
+            .find(|&m| *m == CompositeAlphaMode::PreMultiplied)
             .copied()
-            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+            .unwrap_or(CompositeAlphaMode::Auto);
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -150,23 +163,68 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&self.context.device, &config);
-        let pipeline = self.create_pipeline(surface_format);
+        let bind_group_layout =
+            self.context
+                .device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: Some("Bind Group"),
+                    entries: &[BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+        let global_buffer = self.context.device.create_buffer(&BufferDescriptor {
+            label: Some("Global buffer"),
+            size: size_of::<Globals>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.context.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Globals bind group"),
+            layout: &bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: global_buffer.as_entire_binding(),
+            }],
+        });
+        let pipeline = self.create_pipeline(surface_format, &bind_group_layout);
         let vertex_buffer = self
             .context
             .device
             .create_buffer_init(&BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
-                contents: cast_slice(RECT_VERTICES),
+                contents: cast_slice(QUAD_VERTICES),
                 usage: BufferUsages::VERTEX,
             });
-        let index_buffer =
-            self.context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Index Buffer"),
-                    contents: bytemuck::cast_slice(RECT_INDICES),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
+        let index_buffer = self
+            .context
+            .device
+            .create_buffer_init(&BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: cast_slice(QUAD_INDICES),
+                usage: BufferUsages::INDEX,
+            });
+        let widget_buffer = self
+            .context
+            .device
+            .create_buffer_init(&BufferInitDescriptor {
+                label: Some("Widget Instance Buffer"),
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                contents: cast_slice(&[WidgetInstance::new(
+                    0.0,
+                    0.0,
+                    100.0,
+                    30.0,
+                    Color(1.0, 0.0, 0.0, 1.0),
+                    0.0,
+                )]),
+            });
 
         SurfaceRenderer {
             surface,
@@ -174,8 +232,12 @@ impl Renderer {
             pipeline,
             vertex_buffer,
             index_buffer,
-            num_indices: RECT_INDICES.len() as u32,
+            num_indices: QUAD_INDICES.len() as u32,
             context: self.context.clone(),
+            global_buffer,
+            widget_buffer,
+            widget_count: 1,
+            bind_group,
         }
     }
 }
@@ -209,8 +271,10 @@ impl SurfaceRenderer {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.widget_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
-            pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw_indexed(0..self.num_indices, 0, 0..self.widget_count);
         }
 
         self.context.queue.submit([encoder.finish()]);
@@ -223,5 +287,11 @@ impl SurfaceRenderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.context.device, &self.config);
+        let new_globals = Globals {
+            resolution: Size(width as f32, height as f32),
+        };
+        self.context
+            .queue
+            .write_buffer(&self.global_buffer, 0, bytes_of(&new_globals));
     }
 }
